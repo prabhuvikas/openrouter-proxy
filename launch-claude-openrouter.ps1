@@ -212,6 +212,35 @@ Write-Host "  - ANTHROPIC_MODEL: $mainModel" -ForegroundColor Gray
 Write-Host "  - ANTHROPIC_SMALL_FAST_MODEL: $smallModel" -ForegroundColor Gray
 Write-Host "  - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: 1" -ForegroundColor Gray
 
+# Prompt for working directory
+Write-Host ""
+Write-Host "Enter working directory for Claude Code (or press Enter for current directory):" -ForegroundColor Cyan
+$workingDir = Read-Host
+
+if ([string]::IsNullOrWhiteSpace($workingDir)) {
+    $workingDir = Get-Location
+    Write-Host "Using current directory: $workingDir" -ForegroundColor Gray
+} elseif (-Not (Test-Path $workingDir -PathType Container)) {
+    Write-Host "Directory does not exist: $workingDir" -ForegroundColor Red
+    Write-Host "Using current directory instead." -ForegroundColor Yellow
+    $workingDir = Get-Location
+} else {
+    Write-Host "Using directory: $workingDir" -ForegroundColor Gray
+}
+
+# Prompt for additional CLI arguments
+Write-Host ""
+Write-Host "Additional CLI options (or press Enter to skip):" -ForegroundColor Cyan
+Write-Host "  Examples:" -ForegroundColor Gray
+Write-Host "    --mcp-config path/to/mcp.json    (MCP plugins)" -ForegroundColor Gray
+Write-Host "    --allowedTools 'Bash,Read,Write' (restrict tools)" -ForegroundColor Gray
+Write-Host "    --verbose                        (verbose output)" -ForegroundColor Gray
+$additionalArgs = Read-Host
+
+if (-Not [string]::IsNullOrWhiteSpace($additionalArgs)) {
+    Write-Host "Additional arguments: $additionalArgs" -ForegroundColor Gray
+}
+
 # Launch Claude Code
 Write-Host ""
 Write-Host "Launching Claude Code..." -ForegroundColor Cyan
@@ -220,7 +249,13 @@ Write-Host "Tip: To stop proxy later, run: docker compose -f $scriptDir\docker-c
 Write-Host ""
 
 try {
-    & claude
+    if ([string]::IsNullOrWhiteSpace($additionalArgs)) {
+        & claude $workingDir
+    } else {
+        # Parse additional arguments and invoke claude with all args
+        $argArray = @($workingDir) + ($additionalArgs -split ' (?=-)' | Where-Object { $_ })
+        & claude @argArray
+    }
 }
 catch {
     Write-Host ""
