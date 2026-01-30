@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **GitHub Pages site** - Project documentation at https://prabhuvikas.github.io/openrouter-proxy
+  - Landing page with quick start guide
+  - Jekyll-based static site with Cayman theme
+  - Documentation pages with navigation
 - **Usage Dashboard** (v2.2.0)
   - Real-time statistics at `/dashboard` endpoint
   - Request counts (total, streaming, non-streaming, with tools)

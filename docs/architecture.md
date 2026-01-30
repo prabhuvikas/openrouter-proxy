@@ -1,3 +1,8 @@
+---
+layout: default
+title: Architecture
+---
+
 # Architecture
 
 This document explains how the OpenRouter proxy works and its support for Claude Code agents and MCP.

@@ -1,3 +1,8 @@
+---
+layout: default
+title: Configuration
+---
+
 # Configuration Guide
 
 This guide explains how to configure the OpenRouter proxy using environment variables and `.env` files.
@@ -17,6 +22,50 @@ This guide explains how to configure the OpenRouter proxy using environment vari
 | `ANTHROPIC_SMALL_FAST_MODEL` | No | `z-ai/glm-4.5-air` | Fast model for quick operations |
 | `ANTHROPIC_BASE_URL` | No | `http://localhost:8787` | Proxy URL (auto-set by launcher) |
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | No | `1` | Reduce network traffic (auto-set) |
+
+## Retry and Fallback Configuration
+
+The proxy supports automatic retries with exponential backoff and model fallback when the primary model fails or is rate-limited.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PROXY_MODEL_FALLBACK` | `z-ai/glm-4.5-air` | Fallback model when primary fails |
+| `PROXY_MAX_RETRIES` | `3` | Max retry attempts per model |
+| `PROXY_RETRY_DELAY_MS` | `1000` | Initial retry delay in ms (doubles each retry) |
+| `PROXY_FALLBACK_ON_RATE_LIMIT` | `true` | Immediately switch to fallback on 429 |
+
+### Retry Behavior
+
+1. Request fails with primary model
+2. Retry with exponential backoff (1s, 2s, 4s...)
+3. After max retries, switch to fallback model
+4. Retry fallback model with same backoff
+5. Return error if all attempts fail
+
+### Rate Limit Handling
+
+When OpenRouter returns HTTP 429 (rate limit):
+
+- If `PROXY_FALLBACK_ON_RATE_LIMIT=true`: Immediately switch to fallback model
+- If `PROXY_FALLBACK_ON_RATE_LIMIT=false`: Retry with backoff, then fallback
+
+The proxy respects the `Retry-After` header if provided by OpenRouter.
+
+### Example Configuration
+
+```ini
+# Use a fast model as fallback
+PROXY_MODEL_FALLBACK=z-ai/glm-4.5-air
+
+# Retry 2 times before switching to fallback
+PROXY_MAX_RETRIES=2
+
+# Start with 500ms delay
+PROXY_RETRY_DELAY_MS=500
+
+# Don't immediately fallback on rate limit, retry first
+PROXY_FALLBACK_ON_RATE_LIMIT=false
+```
 
 ## .env File Format
 

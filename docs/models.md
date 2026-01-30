@@ -1,3 +1,8 @@
+---
+layout: default
+title: Model Guide
+---
+
 # Model Guide
 
 Recommendations for choosing OpenRouter models to use with Claude Code.
