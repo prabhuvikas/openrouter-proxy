@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 WORKDIR /app
 
 # Create package.json
-RUN cat > package.json << 'EOF'
+COPY <<EOF package.json
 {
   "name": "openrouter-proxy",
   "version": "1.0.0",
@@ -30,7 +30,7 @@ EOF
 RUN npm install
 
 # Create proxy server that converts Anthropic API to OpenAI format
-RUN cat > proxy.js << 'PROXYEOF'
+COPY <<'PROXYEOF' proxy.js
 const express = require("express");
 const https = require("https");
 
