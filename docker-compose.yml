@@ -1,0 +1,21 @@
+services:
+  y-router:
+    build:
+      context: .
+      dockerfile: Dockerfile.y-router
+    container_name: y-router
+    ports:
+      - "8787:8787"
+    environment:
+      # Y-router configuration
+      - NODE_ENV=production
+      - LOG_LEVEL=info
+    restart: unless-stopped
+    # Cloudflare Worker doesn't have a standard /health endpoint
+    # Worker will be ready once wrangler starts
+    networks:
+      - openrouter-network
+
+networks:
+  openrouter-network:
+    driver: bridge

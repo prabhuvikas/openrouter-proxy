@@ -1,0 +1,434 @@
+# Standalone Node.js proxy for Anthropic to OpenAI format conversion
+# Properly handles Claude Code requests and forwards to OpenRouter
+
+FROM node:22-bookworm-slim
+
+# Install curl for health checks
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Create package.json
+RUN cat > package.json << 'EOF'
+{
+  "name": "openrouter-proxy",
+  "version": "1.0.0",
+  "description": "Anthropic to OpenRouter proxy",
+  "main": "proxy.js",
+  "scripts": {
+    "start": "node proxy.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
+EOF
+
+# Install dependencies
+RUN npm install
+
+# Create proxy server that converts Anthropic API to OpenAI format
+RUN cat > proxy.js << 'PROXYEOF'
+const express = require("express");
+const https = require("https");
+
+const app = express();
+app.use(express.json({ limit: "50mb" }));
+
+const PORT = 8787;
+const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+
+// Format conversion functions
+
+// Convert Anthropic messages to OpenAI format (with agent/MCP support)
+function convertMessages(anthropicMessages) {
+  return anthropicMessages.map(msg => {
+    const openaiMsg = {
+      role: msg.role,
+      content: msg.content
+    };
+
+    // Handle complex content (text, tool_use, tool_result) - common in agents
+    if (msg.content && Array.isArray(msg.content)) {
+      const content = [];
+
+      for (const block of msg.content) {
+        if (block.type === 'tool_result') {
+          // Preserve tool result metadata for agent loops
+          const toolResult = {
+            type: 'tool_result',
+            tool_use_id: block.tool_use_id,
+            content: block.content
+          };
+
+          // Preserve error flag if present (important for agent error handling)
+          if (block.is_error) {
+            toolResult.is_error = block.is_error;
+          }
+
+          content.push(toolResult);
+        } else if (block.type === 'text') {
+          // Add text directly to content array
+          content.push(block.text);
+        } else if (block.type === 'tool_use') {
+          // If somehow we get a tool_use in the message (shouldn't happen), skip it
+          // OpenAI format doesn't expect tool_use in messages
+          console.log("Warning: Found tool_use block in message content (should not happen)");
+        } else {
+          // Pass through any other block types
+          content.push(block);
+        }
+      }
+
+      openaiMsg.content = content;
+    }
+
+    return openaiMsg;
+  });
+}
+
+// Convert Anthropic tools to OpenAI functions
+function convertTools(anthropicTools) {
+  if (!anthropicTools || !Array.isArray(anthropicTools)) return undefined;
+
+  return anthropicTools.map(tool => ({
+    type: 'function',
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.input_schema
+    }
+  }));
+}
+
+function anthropicToOpenAI(anthropicMsg) {
+  // Handle system prompt - convert to OpenAI format
+  let messages = convertMessages(anthropicMsg.messages || []);
+
+  // If system prompt is provided as a separate field, insert it as the first message
+  if (anthropicMsg.system) {
+    messages.unshift({
+      role: 'system',
+      content: typeof anthropicMsg.system === 'string' ? anthropicMsg.system : anthropicMsg.system
+    });
+  }
+
+  const openaiMsg = {
+    model: anthropicMsg.model,
+    messages: messages,
+    max_tokens: anthropicMsg.max_tokens,
+    temperature: anthropicMsg.temperature,
+    top_p: anthropicMsg.top_p,
+    stream: anthropicMsg.stream === true
+  };
+
+  // Add tools if present (converted to OpenAI format)
+  if (anthropicMsg.tools && anthropicMsg.tools.length > 0) {
+    openaiMsg.tools = convertTools(anthropicMsg.tools);
+  }
+
+  // Preserve other Anthropic parameters that OpenRouter/OpenAI might support
+  if (anthropicMsg.stop_sequences) {
+    openaiMsg.stop = anthropicMsg.stop_sequences;
+  }
+
+  // Add tool_choice if specified (for agent behavior)
+  if (anthropicMsg.tool_choice) {
+    openaiMsg.tool_choice = anthropicMsg.tool_choice;
+  }
+
+  // Remove undefined values
+  Object.keys(openaiMsg).forEach(key => openaiMsg[key] === undefined && delete openaiMsg[key]);
+
+  console.log("Converted request - tools:", openaiMsg.tools ? openaiMsg.tools.length : 0, "with system prompt:", !!anthropicMsg.system);
+  return openaiMsg;
+}
+
+// Convert OpenAI complete response to Anthropic format
+function openAIResponseToAnthropic(openaiResponse, model) {
+  if (!openaiResponse.choices || openaiResponse.choices.length === 0) {
+    return null;
+  }
+
+  const choice = openaiResponse.choices[0];
+  const message = choice.message || {};
+
+  // Build content array
+  const content = [];
+
+  // Add text content if present
+  if (message.content && typeof message.content === 'string') {
+    content.push({
+      type: 'text',
+      text: message.content
+    });
+  }
+
+  // Convert tool calls to Anthropic format (important for agents/MCP)
+  if (message.tool_calls && Array.isArray(message.tool_calls)) {
+    console.log("Converting", message.tool_calls.length, "tool calls to Anthropic format");
+
+    message.tool_calls.forEach(toolCall => {
+      if (toolCall.type === 'function') {
+        let parsedInput = {};
+
+        // Parse tool arguments if they're a string
+        if (typeof toolCall.function.arguments === 'string') {
+          try {
+            parsedInput = JSON.parse(toolCall.function.arguments);
+          } catch (e) {
+            console.error("Failed to parse tool arguments:", e.message);
+            parsedInput = { raw: toolCall.function.arguments };
+          }
+        } else {
+          parsedInput = toolCall.function.arguments || {};
+        }
+
+        content.push({
+          type: 'tool_use',
+          id: toolCall.id,
+          name: toolCall.function.name,
+          input: parsedInput
+        });
+      }
+    });
+  }
+
+  // If no content, add empty text
+  if (content.length === 0) {
+    content.push({
+      type: 'text',
+      text: ''
+    });
+  }
+
+  return {
+    id: openaiResponse.id || 'msg_' + Date.now(),
+    type: 'message',
+    role: 'assistant',
+    content: content,
+    model: model,
+    stop_reason: message.tool_calls ? 'tool_use' : (choice.finish_reason === 'length' ? 'max_tokens' : 'end_turn'),
+    usage: {
+      input_tokens: openaiResponse.usage?.prompt_tokens || 0,
+      output_tokens: openaiResponse.usage?.completion_tokens || 0
+    }
+  };
+}
+
+function openAIToAnthropic(openaiChunk) {
+  try {
+    // Parse SSE format if streaming
+    if (typeof openaiChunk === 'string' && openaiChunk.startsWith('data: ')) {
+      const jsonStr = openaiChunk.replace('data: ', '').trim();
+      if (jsonStr === '[DONE]') {
+        return { type: 'message_stop' };
+      }
+      const data = JSON.parse(jsonStr);
+      return convertDelta(data);
+    }
+    return convertDelta(openaiChunk);
+  } catch (e) {
+    console.error('Error converting response:', e.message);
+    return null;
+  }
+}
+
+function convertDelta(data) {
+  if (!data.choices || !data.choices[0]) return null;
+
+  const choice = data.choices[0];
+  const delta = choice.delta || {};
+
+  // Handle content_filter events
+  if (choice.content_filter_results) {
+    return null;
+  }
+
+  // Text content streaming
+  if (delta.content) {
+    return {
+      type: 'content_block_delta',
+      index: 0,
+      content_block: { type: 'text' },
+      delta: { type: 'text_delta', text: delta.content }
+    };
+  }
+
+  // Tool call start
+  if (delta.tool_calls && delta.tool_calls.length > 0) {
+    const toolCall = delta.tool_calls[0];
+    return {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'tool_use',
+        id: toolCall.id,
+        name: toolCall.function?.name || '',
+        input: {}
+      }
+    };
+  }
+
+  // Finish reason (end of message)
+  if (choice.finish_reason) {
+    const stopReason = choice.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn';
+    return {
+      type: 'message_delta',
+      delta: { stop_reason: stopReason },
+      stop_reason: stopReason
+    };
+  }
+
+  return null;
+}
+
+// Logging middleware
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
+// Proxy endpoint for messages
+app.all("/v1/messages", (req, res) => {
+  console.log("Received Anthropic API request");
+
+  if (!req.get("authorization")) {
+    return res.status(401).json({ error: "Unauthorized: Missing authorization header" });
+  }
+
+  const authToken = req.get("authorization");
+
+  // Log agent/MCP request details
+  const hasSystem = !!req.body.system;
+  const hasTools = req.body.tools && req.body.tools.length > 0;
+  const messageCount = req.body.messages ? req.body.messages.length : 0;
+
+  if (hasSystem || hasTools) {
+    console.log(`Agent/MCP request: system=${hasSystem}, tools=${req.body.tools?.length || 0}, messages=${messageCount}`);
+  }
+
+  // Convert Anthropic format to OpenAI format
+  const openaiBody = anthropicToOpenAI(req.body);
+  console.log("Converted to OpenAI format, model:", openaiBody.model, "streaming:", openaiBody.stream);
+
+  // Prepare OpenRouter request
+  const options = {
+    hostname: "openrouter.ai",
+    port: 443,
+    path: "/api/v1/chat/completions",
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": authToken,
+      "User-Agent": "Claude-Proxy/1.0"
+    }
+  };
+
+  const bodyStr = JSON.stringify(openaiBody);
+
+  const proxyReq = https.request(options, (proxyRes) => {
+    console.log("OpenRouter response status:", proxyRes.statusCode);
+
+    // For streaming responses
+    if (openaiBody.stream) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      });
+
+      let buffer = '';
+      proxyRes.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines[lines.length - 1];
+
+        for (let i = 0; i < lines.length - 1; i++) {
+          const line = lines[i];
+          if (line.startsWith('data: ')) {
+            const converted = openAIToAnthropic(line);
+            if (converted) {
+              res.write(`data: ${JSON.stringify(converted)}\n\n`);
+            }
+          }
+        }
+      });
+
+      proxyRes.on('end', () => {
+        res.write('data: {"type":"message_stop"}\n\n');
+        res.end();
+      });
+    } else {
+      // Non-streaming response
+      let data = '';
+      proxyRes.on('data', (chunk) => {
+        data += chunk;
+      });
+      proxyRes.on('end', () => {
+        try {
+          const openaiResponse = JSON.parse(data);
+          console.log("OpenRouter response received, converting to Anthropic format");
+
+          // If it's an error response, pass it through
+          if (openaiResponse.error) {
+            console.log("Error response from OpenRouter:", openaiResponse.error);
+            res.status(proxyRes.statusCode).json(openaiResponse);
+            return;
+          }
+
+          // Convert OpenAI format to Anthropic format
+          const anthropicResponse = openAIResponseToAnthropic(openaiResponse, openaiBody.model);
+          console.log("Converted response, sending back to Claude Code");
+          res.status(proxyRes.statusCode).json(anthropicResponse);
+        } catch (e) {
+          console.error("Error parsing response:", e.message);
+          res.status(proxyRes.statusCode).send(data);
+        }
+      });
+    }
+  });
+
+  proxyReq.on("error", (err) => {
+    console.error("OpenRouter error:", err.message);
+    res.status(502).json({ error: "Bad Gateway", message: err.message });
+  });
+
+  proxyReq.write(bodyStr);
+  proxyReq.end();
+});
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+app.get("/", (req, res) => {
+  res.json({ name: "OpenRouter Proxy", status: "running" });
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log("");
+  console.log("✓ Anthropic to OpenRouter proxy listening on http://localhost:" + PORT);
+  console.log("  Converting Anthropic format → OpenAI format");
+  console.log("  Forwarding to: " + OPENROUTER_BASE);
+  console.log("");
+});
+
+app.on("error", (err) => {
+  console.error("Server error:", err);
+  process.exit(1);
+});
+PROXYEOF
+
+# Expose port
+EXPOSE 8787
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=5s --retries=5 --start-period=10s \
+    CMD curl -f http://localhost:8787/health || exit 1
+
+# Start proxy
+CMD ["npm", "start"]
