@@ -62,7 +62,7 @@ jobs:
       - name: Run integration tests (API calls)
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          TEST_MODEL: meta-llama/llama-3.2-3b-instruct:free
+          TEST_MODEL: z-ai/glm-4.5-air
         run: |
           echo "Running integration tests with model: $TEST_MODEL"
           node test-integration.js

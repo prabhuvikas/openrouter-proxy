@@ -12,7 +12,7 @@
 const http = require('http');
 
 const PROXY_URL = 'http://localhost:8787';
-const TEST_MODEL = process.env.TEST_MODEL || 'meta-llama/llama-3.2-3b-instruct:free';
+const TEST_MODEL = process.env.TEST_MODEL || 'z-ai/glm-4.5-air';
 const API_KEY = process.env.OPENROUTER_API_KEY;
 
 // Retry configuration for rate limits
