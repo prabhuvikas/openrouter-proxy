@@ -1,0 +1,80 @@
+name: PR Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: Build and Test Proxy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check for OpenRouter API key
+        run: |
+          if [ -z "${{ secrets.OPENROUTER_API_KEY }}" ]; then
+            echo "ERROR: OPENROUTER_API_KEY secret is not configured"
+            echo "Please add it in Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+          echo "OpenRouter API key is configured"
+
+      - name: Build Docker container
+        run: |
+          docker build -f Dockerfile.y-router -t y-router:test .
+
+      - name: Start proxy container
+        run: |
+          docker run -d --name y-router -p 8787:8787 y-router:test
+          # Wait for container to be healthy
+          echo "Waiting for proxy to be ready..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8787/health > /dev/null 2>&1; then
+              echo "Proxy is ready!"
+              break
+            fi
+            echo "Attempt $i/30 - waiting..."
+            sleep 1
+          done
+
+      - name: Verify proxy health
+        run: |
+          curl -f http://localhost:8787/health
+          echo ""
+          curl -f http://localhost:8787/
+          echo ""
+
+      - name: Run unit tests (format conversion)
+        run: |
+          echo "Running conversion tests..."
+          node test-conversion.js
+
+      - name: Run integration tests (API calls)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TEST_MODEL: meta-llama/llama-3.2-3b-instruct:free
+        run: |
+          echo "Running integration tests with model: $TEST_MODEL"
+          node test-integration.js
+
+      - name: Show proxy logs on failure
+        if: failure()
+        run: |
+          echo "=== Proxy Container Logs ==="
+          docker logs y-router
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop y-router || true
+          docker rm y-router || true
