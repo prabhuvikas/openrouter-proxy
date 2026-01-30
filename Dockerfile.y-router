@@ -40,6 +40,87 @@ app.use(express.json({ limit: "50mb" }));
 const PORT = 8787;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
+// Retry and fallback configuration
+const FALLBACK_MODEL = process.env.PROXY_MODEL_FALLBACK || 'z-ai/glm-4.5-air';
+const MAX_RETRIES = parseInt(process.env.PROXY_MAX_RETRIES || '3', 10);
+const RETRY_DELAY_MS = parseInt(process.env.PROXY_RETRY_DELAY_MS || '1000', 10);
+const FALLBACK_ON_RATE_LIMIT = process.env.PROXY_FALLBACK_ON_RATE_LIMIT !== 'false';
+
+// ============================================================================
+// USAGE STATISTICS (in-memory, resets on restart)
+// ============================================================================
+
+const stats = {
+  startTime: Date.now(),
+  requests: {
+    total: 0,
+    streaming: 0,
+    nonStreaming: 0,
+    withTools: 0
+  },
+  tokens: {
+    input: 0,
+    output: 0
+  },
+  models: {},        // { "model-name": { requests: N, inputTokens: N, outputTokens: N } }
+  errors: {
+    total: 0,
+    rateLimits: 0,
+    apiErrors: 0,
+    networkErrors: 0
+  },
+  fallbacks: 0,      // Times fallback model was used
+  lastRequest: null  // Timestamp of last request
+};
+
+function recordRequest(model, isStreaming, hasTools) {
+  stats.requests.total++;
+  stats.lastRequest = Date.now();
+
+  if (isStreaming) stats.requests.streaming++;
+  else stats.requests.nonStreaming++;
+
+  if (hasTools) stats.requests.withTools++;
+
+  if (!stats.models[model]) {
+    stats.models[model] = { requests: 0, inputTokens: 0, outputTokens: 0 };
+  }
+  stats.models[model].requests++;
+}
+
+function recordTokens(model, inputTokens, outputTokens) {
+  stats.tokens.input += inputTokens;
+  stats.tokens.output += outputTokens;
+
+  if (stats.models[model]) {
+    stats.models[model].inputTokens += inputTokens;
+    stats.models[model].outputTokens += outputTokens;
+  }
+}
+
+function recordError(type) {
+  stats.errors.total++;
+  if (type === 'rate_limit') stats.errors.rateLimits++;
+  else if (type === 'api_error') stats.errors.apiErrors++;
+  else if (type === 'network_error') stats.errors.networkErrors++;
+}
+
+function recordFallback() {
+  stats.fallbacks++;
+}
+
+function formatUptime(ms) {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+
+  if (days > 0) return `${days}d ${hours % 24}h ${minutes % 60}m`;
+  if (hours > 0) return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
+  if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+  return `${seconds}s`;
+}
+
 // ============================================================================
 // FORMAT CONVERSION FUNCTIONS
 // ============================================================================
@@ -573,6 +654,141 @@ function generateStreamEndEvents(streamState) {
 }
 
 // ============================================================================
+// RETRY AND FALLBACK LOGIC
+// ============================================================================
+
+// Helper for delay
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Make a single request to OpenRouter (returns Promise)
+function makeOpenRouterRequest(openaiBody, authToken) {
+  return new Promise((resolve, reject) => {
+    const bodyStr = JSON.stringify(openaiBody);
+
+    const options = {
+      hostname: "openrouter.ai",
+      port: 443,
+      path: "/api/v1/chat/completions",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": authToken,
+        "User-Agent": "Claude-Proxy/2.1.0",
+        "HTTP-Referer": "https://github.com/anthropics/claude-code",
+        "X-Title": "Claude Code Proxy"
+      }
+    };
+
+    const req = https.request(options, (proxyRes) => {
+      // Rate limit detection
+      if (proxyRes.statusCode === 429) {
+        let errorData = '';
+        proxyRes.on('data', chunk => errorData += chunk);
+        proxyRes.on('end', () => {
+          const retryAfter = proxyRes.headers['retry-after'];
+          reject({
+            type: 'rate_limit',
+            statusCode: 429,
+            retryAfter: retryAfter ? parseInt(retryAfter, 10) * 1000 : null,
+            message: errorData
+          });
+        });
+        return;
+      }
+
+      // Other errors
+      if (proxyRes.statusCode >= 400) {
+        let errorData = '';
+        proxyRes.on('data', chunk => errorData += chunk);
+        proxyRes.on('end', () => {
+          reject({
+            type: 'api_error',
+            statusCode: proxyRes.statusCode,
+            message: errorData
+          });
+        });
+        return;
+      }
+
+      // Success - resolve with response stream
+      resolve({
+        statusCode: proxyRes.statusCode,
+        headers: proxyRes.headers,
+        stream: proxyRes
+      });
+    });
+
+    req.on('error', (err) => {
+      reject({
+        type: 'network_error',
+        message: err.message
+      });
+    });
+
+    req.write(bodyStr);
+    req.end();
+  });
+}
+
+// Make request with retry logic and model fallback
+async function makeRequestWithRetry(openaiBody, authToken, originalModel) {
+  // Build list of models to try
+  const models = [originalModel];
+  if (FALLBACK_MODEL && FALLBACK_MODEL !== originalModel) {
+    models.push(FALLBACK_MODEL);
+  }
+
+  let lastError = null;
+
+  for (let modelIndex = 0; modelIndex < models.length; modelIndex++) {
+    const model = models[modelIndex];
+    const isLastModel = modelIndex === models.length - 1;
+    const bodyWithModel = { ...openaiBody, model };
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      const isLastAttempt = attempt === MAX_RETRIES;
+
+      try {
+        console.log(`Trying model: ${model} (attempt ${attempt}/${MAX_RETRIES})`);
+        const result = await makeOpenRouterRequest(bodyWithModel, authToken);
+        console.log(`Success with model: ${model}`);
+        return { ...result, modelUsed: model };
+
+      } catch (err) {
+        lastError = err;
+        console.log(`Attempt ${attempt}/${MAX_RETRIES} failed for ${model}: ${err.type} - ${err.message?.substring(0, 100) || ''}`);
+
+        // Rate limit with immediate fallback option
+        if (err.type === 'rate_limit' && FALLBACK_ON_RATE_LIMIT && !isLastModel) {
+          console.log(`Rate limited (429), switching to fallback model: ${FALLBACK_MODEL}`);
+          break; // Exit retry loop, try next model
+        }
+
+        // If last attempt for this model
+        if (isLastAttempt) {
+          if (!isLastModel) {
+            console.log(`Max retries reached for ${model}, trying fallback: ${models[modelIndex + 1]}`);
+          }
+          break; // Try next model
+        }
+
+        // Calculate delay with exponential backoff
+        const backoffDelay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+        const waitTime = err.retryAfter || backoffDelay;
+        console.log(`Waiting ${waitTime}ms before retry...`);
+        await delay(waitTime);
+      }
+    }
+  }
+
+  // All models and retries exhausted
+  console.log(`All retry attempts exhausted. Last error: ${lastError?.type}`);
+  throw lastError;
+}
+
+// ============================================================================
 // HTTP SERVER AND REQUEST HANDLING
 // ============================================================================
 
@@ -582,7 +798,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Proxy endpoint for messages
+// Proxy endpoint for messages (with retry and fallback support)
 app.all("/v1/messages", (req, res) => {
   console.log("Received Anthropic API request");
 
@@ -609,186 +825,313 @@ app.all("/v1/messages", (req, res) => {
 
   // Convert Anthropic format to OpenAI format
   const openaiBody = anthropicToOpenAI(req.body);
-  console.log("Converted to OpenAI format, sending to OpenRouter");
+  const originalModel = openaiBody.model;
+  const isStreaming = openaiBody.stream;
+  console.log(`Converted to OpenAI format, primary model: ${originalModel}, fallback: ${FALLBACK_MODEL}`);
 
-  // Prepare OpenRouter request
-  const options = {
-    hostname: "openrouter.ai",
-    port: 443,
-    path: "/api/v1/chat/completions",
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": authToken,
-      "User-Agent": "Claude-Proxy/1.0",
-      "HTTP-Referer": "https://github.com/anthropics/claude-code",
-      "X-Title": "Claude Code Proxy"
-    }
-  };
+  // Use async IIFE to handle the request with retry logic
+  (async () => {
+    try {
+      // Make request with retry and fallback
+      const result = await makeRequestWithRetry(openaiBody, authToken, originalModel);
+      const { stream: proxyRes, modelUsed } = result;
 
-  const bodyStr = JSON.stringify(openaiBody);
+      console.log(`OpenRouter response received (model used: ${modelUsed})`);
 
-  const proxyReq = https.request(options, (proxyRes) => {
-    console.log("OpenRouter response status:", proxyRes.statusCode);
+      // Record request statistics
+      recordRequest(modelUsed, isStreaming, hasTools);
+      if (modelUsed !== originalModel) {
+        recordFallback();
+      }
 
-    // Handle error status codes
-    if (proxyRes.statusCode >= 400) {
-      let errorData = '';
-      proxyRes.on('data', chunk => errorData += chunk);
-      proxyRes.on('end', () => {
-        console.error("OpenRouter error response:", errorData);
-        try {
-          const errorJson = JSON.parse(errorData);
-          // Convert to Anthropic error format
-          res.status(proxyRes.statusCode).json({
-            type: 'error',
-            error: {
-              type: errorJson.error?.type || 'api_error',
-              message: errorJson.error?.message || errorData
+      // For streaming responses
+      if (openaiBody.stream) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+          'X-Model-Used': modelUsed
+        });
+
+        const streamState = createStreamState(modelUsed);
+        let buffer = '';
+
+        proxyRes.on('data', (chunk) => {
+          buffer += chunk.toString();
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const trimmedLine = line.trim();
+            if (!trimmedLine) continue;
+
+            if (trimmedLine.startsWith('data: ')) {
+              const events = processStreamingChunk(trimmedLine, streamState);
+              for (const event of events) {
+                res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+              }
             }
-          });
-        } catch (e) {
-          res.status(proxyRes.statusCode).json({
-            type: 'error',
-            error: { type: 'api_error', message: errorData }
-          });
-        }
-      });
-      return;
-    }
+          }
+        });
 
-    // For streaming responses
-    if (openaiBody.stream) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no'
-      });
-
-      const streamState = createStreamState(openaiBody.model);
-      let buffer = '';
-
-      proxyRes.on('data', (chunk) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-        for (const line of lines) {
-          const trimmedLine = line.trim();
-          if (!trimmedLine) continue;
-
-          if (trimmedLine.startsWith('data: ')) {
-            const events = processStreamingChunk(trimmedLine, streamState);
+        proxyRes.on('end', () => {
+          if (buffer.trim()) {
+            const events = processStreamingChunk(buffer.trim(), streamState);
             for (const event of events) {
               res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
             }
           }
-        }
-      });
 
-      proxyRes.on('end', () => {
-        // Process any remaining buffer
-        if (buffer.trim()) {
-          const events = processStreamingChunk(buffer.trim(), streamState);
-          for (const event of events) {
+          const endEvents = generateStreamEndEvents(streamState);
+          for (const event of endEvents) {
             res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
           }
-        }
 
-        // Generate end events
-        const endEvents = generateStreamEndEvents(streamState);
-        for (const event of endEvents) {
-          res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
-        }
+          console.log(`Streaming complete (model: ${modelUsed}), tool_calls: ${Object.keys(streamState.toolCalls).length}`);
+          res.end();
+        });
 
-        console.log("Streaming complete, tool_calls:", Object.keys(streamState.toolCalls).length);
-        res.end();
-      });
+        proxyRes.on('error', (err) => {
+          console.error("Streaming error:", err.message);
+          res.end();
+        });
 
-      proxyRes.on('error', (err) => {
-        console.error("Streaming error:", err.message);
-        res.end();
-      });
-    } else {
-      // Non-streaming response
-      let data = '';
-      proxyRes.on('data', (chunk) => {
-        data += chunk;
-      });
+      } else {
+        // Non-streaming response
+        let data = '';
+        proxyRes.on('data', (chunk) => {
+          data += chunk;
+        });
 
-      proxyRes.on('end', () => {
-        try {
-          const openaiResponse = JSON.parse(data);
-          console.log("OpenRouter response received");
+        proxyRes.on('end', () => {
+          try {
+            const openaiResponse = JSON.parse(data);
 
-          // If it's an error response, convert to Anthropic format
-          if (openaiResponse.error) {
-            console.log("Error response from OpenRouter:", openaiResponse.error);
-            res.status(proxyRes.statusCode >= 400 ? proxyRes.statusCode : 400).json({
+            if (openaiResponse.error) {
+              console.log("Error in response body:", openaiResponse.error);
+              res.status(400).json({
+                type: 'error',
+                error: {
+                  type: openaiResponse.error.type || 'api_error',
+                  message: openaiResponse.error.message || JSON.stringify(openaiResponse.error)
+                }
+              });
+              return;
+            }
+
+            // Convert OpenAI format to Anthropic format
+            const anthropicResponse = openAIResponseToAnthropic(openaiResponse, modelUsed);
+
+            // Record token usage
+            if (anthropicResponse.usage) {
+              recordTokens(modelUsed, anthropicResponse.usage.input_tokens, anthropicResponse.usage.output_tokens);
+            }
+
+            // Log response details
+            const toolUseCount = anthropicResponse.content.filter(c => c.type === 'tool_use').length;
+            console.log(`Response (model: ${modelUsed}): stop_reason=${anthropicResponse.stop_reason}, ` +
+                        `content_blocks=${anthropicResponse.content.length}, tool_use=${toolUseCount}`);
+
+            res.setHeader('X-Model-Used', modelUsed);
+            res.status(200).json(anthropicResponse);
+          } catch (e) {
+            console.error("Error parsing response:", e.message);
+            console.error("Raw response:", data.substring(0, 500));
+            res.status(500).json({
               type: 'error',
-              error: {
-                type: openaiResponse.error.type || 'api_error',
-                message: openaiResponse.error.message || JSON.stringify(openaiResponse.error)
-              }
+              error: { type: 'api_error', message: 'Failed to parse OpenRouter response' }
             });
-            return;
           }
+        });
+      }
 
-          // Convert OpenAI format to Anthropic format
-          const anthropicResponse = openAIResponseToAnthropic(openaiResponse, openaiBody.model);
+    } catch (err) {
+      // All retries and fallback exhausted
+      console.error(`Request failed after all retries: ${err.type} - ${err.message?.substring(0, 200) || ''}`);
 
-          // Log response details
-          const toolUseCount = anthropicResponse.content.filter(c => c.type === 'tool_use').length;
-          console.log(`Response: stop_reason=${anthropicResponse.stop_reason}, ` +
-                      `content_blocks=${anthropicResponse.content.length}, tool_use=${toolUseCount}`);
+      // Record error statistics
+      recordError(err.type);
 
-          res.status(200).json(anthropicResponse);
-        } catch (e) {
-          console.error("Error parsing response:", e.message);
-          console.error("Raw response:", data.substring(0, 500));
-          res.status(500).json({
-            type: 'error',
-            error: { type: 'api_error', message: 'Failed to parse OpenRouter response' }
-          });
+      const statusCode = err.statusCode || 502;
+      let errorMessage = 'Request failed after all retry attempts';
+
+      if (err.type === 'rate_limit') {
+        errorMessage = 'Rate limited by OpenRouter. All retry attempts exhausted.';
+      } else if (err.type === 'network_error') {
+        errorMessage = 'Network error connecting to OpenRouter: ' + (err.message || 'Unknown error');
+      } else if (err.type === 'api_error') {
+        try {
+          const parsed = JSON.parse(err.message);
+          errorMessage = parsed.error?.message || err.message;
+        } catch {
+          errorMessage = err.message || 'API error';
+        }
+      }
+
+      res.status(statusCode).json({
+        type: 'error',
+        error: {
+          type: err.type || 'api_error',
+          message: errorMessage
         }
       });
     }
-  });
-
-  proxyReq.on("error", (err) => {
-    console.error("OpenRouter connection error:", err.message);
-    res.status(502).json({
-      type: 'error',
-      error: { type: 'api_error', message: 'Failed to connect to OpenRouter: ' + err.message }
-    });
-  });
-
-  proxyReq.write(bodyStr);
-  proxyReq.end();
+  })();
 });
 
 // Health check endpoint
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
-    version: "2.0.0",
-    features: ["tools", "streaming", "tool_choice", "mcp"]
+    version: "2.2.0",
+    features: ["tools", "streaming", "tool_choice", "mcp", "retry", "fallback", "dashboard"]
   });
+});
+
+// ============================================================================
+// USAGE DASHBOARD
+// ============================================================================
+
+function generateHtmlDashboard(statsData) {
+  const modelRows = Object.entries(statsData.models)
+    .map(([name, data]) => `
+      <tr>
+        <td>${name}</td>
+        <td>${data.requests}</td>
+        <td>${data.inputTokens.toLocaleString()}</td>
+        <td>${data.outputTokens.toLocaleString()}</td>
+      </tr>
+    `).join('');
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <title>OpenRouter Proxy Dashboard</title>
+  <meta http-equiv="refresh" content="10">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+           max-width: 900px; margin: 40px auto; padding: 20px; background: #f5f5f5; }
+    h1 { color: #333; }
+    .card { background: white; border-radius: 8px; padding: 20px; margin: 20px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 20px; }
+    .stat { text-align: center; }
+    .stat-value { font-size: 2em; font-weight: bold; color: #2563eb; }
+    .stat-label { color: #666; font-size: 0.9em; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; }
+    th { background: #f8f9fa; }
+    .error { color: #dc2626; }
+    .success { color: #16a34a; }
+    .uptime { color: #666; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1>OpenRouter Proxy Dashboard</h1>
+  <p class="uptime">Uptime: ${statsData.uptime} | Last request: ${statsData.lastRequest || 'None'}</p>
+
+  <div class="card">
+    <h2>Requests</h2>
+    <div class="stats">
+      <div class="stat"><div class="stat-value">${statsData.requests.total}</div><div class="stat-label">Total</div></div>
+      <div class="stat"><div class="stat-value">${statsData.requests.streaming}</div><div class="stat-label">Streaming</div></div>
+      <div class="stat"><div class="stat-value">${statsData.requests.withTools}</div><div class="stat-label">With Tools</div></div>
+      <div class="stat"><div class="stat-value">${statsData.fallbacks}</div><div class="stat-label">Fallbacks</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Tokens</h2>
+    <div class="stats">
+      <div class="stat"><div class="stat-value">${statsData.tokens.total.toLocaleString()}</div><div class="stat-label">Total</div></div>
+      <div class="stat"><div class="stat-value">${statsData.tokens.input.toLocaleString()}</div><div class="stat-label">Input</div></div>
+      <div class="stat"><div class="stat-value">${statsData.tokens.output.toLocaleString()}</div><div class="stat-label">Output</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Models</h2>
+    <table>
+      <tr><th>Model</th><th>Requests</th><th>Input Tokens</th><th>Output Tokens</th></tr>
+      ${modelRows || '<tr><td colspan="4">No requests yet</td></tr>'}
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Errors</h2>
+    <div class="stats">
+      <div class="stat"><div class="stat-value ${statsData.errors.total > 0 ? 'error' : 'success'}">${statsData.errors.total}</div><div class="stat-label">Total</div></div>
+      <div class="stat"><div class="stat-value">${statsData.errors.rateLimits}</div><div class="stat-label">Rate Limits</div></div>
+      <div class="stat"><div class="stat-value">${statsData.errors.apiErrors}</div><div class="stat-label">API Errors</div></div>
+      <div class="stat"><div class="stat-value">${statsData.errors.rate}</div><div class="stat-label">Error Rate</div></div>
+    </div>
+  </div>
+
+  <p style="text-align:center;color:#999;font-size:0.8em;">Auto-refreshes every 10 seconds</p>
+</body>
+</html>`;
+}
+
+// Dashboard endpoint - returns usage statistics
+app.get("/dashboard", (req, res) => {
+  const uptime = Date.now() - stats.startTime;
+  const statsData = {
+    status: "ok",
+    uptime: formatUptime(uptime),
+    uptimeMs: uptime,
+    lastRequest: stats.lastRequest ? new Date(stats.lastRequest).toISOString() : null,
+    requests: stats.requests,
+    tokens: {
+      total: stats.tokens.input + stats.tokens.output,
+      input: stats.tokens.input,
+      output: stats.tokens.output
+    },
+    models: stats.models,
+    errors: {
+      ...stats.errors,
+      rate: stats.requests.total > 0
+        ? (stats.errors.total / stats.requests.total * 100).toFixed(2) + '%'
+        : '0%'
+    },
+    fallbacks: stats.fallbacks
+  };
+
+  if (req.query.format === 'html') {
+    res.setHeader('Content-Type', 'text/html');
+    res.send(generateHtmlDashboard(statsData));
+  } else {
+    res.json(statsData);
+  }
 });
 
 // Info endpoint
 app.get("/", (req, res) => {
   res.json({
     name: "OpenRouter Proxy",
-    version: "2.0.0",
+    version: "2.2.0",
     status: "running",
     target: OPENROUTER_BASE,
     features: {
       tools: true,
       streaming: true,
       tool_choice: true,
-      mcp_support: true
+      mcp_support: true,
+      retry: true,
+      fallback: true,
+      dashboard: true
+    },
+    config: {
+      fallback_model: FALLBACK_MODEL,
+      max_retries: MAX_RETRIES,
+      retry_delay_ms: RETRY_DELAY_MS,
+      fallback_on_rate_limit: FALLBACK_ON_RATE_LIMIT
+    },
+    endpoints: {
+      messages: "/v1/messages",
+      health: "/health",
+      dashboard: "/dashboard",
+      dashboard_html: "/dashboard?format=html"
     }
   });
 });
@@ -810,11 +1153,18 @@ app.post("/debug/convert", (req, res) => {
 app.listen(PORT, () => {
   console.log("");
   console.log("╔════════════════════════════════════════════════════════════╗");
-  console.log("║  OpenRouter Proxy v2.0.0 - MCP/Tools Support               ║");
+  console.log("║  OpenRouter Proxy v2.2.0 - Usage Dashboard                 ║");
   console.log("╠════════════════════════════════════════════════════════════╣");
-  console.log("║  Local:    http://localhost:" + PORT + "                          ║");
-  console.log("║  Target:   " + OPENROUTER_BASE + "               ║");
-  console.log("║  Features: tools, streaming, tool_choice, mcp              ║");
+  console.log("║  Local:     http://localhost:" + PORT + "                         ║");
+  console.log("║  Target:    " + OPENROUTER_BASE + "              ║");
+  console.log("║  Dashboard: http://localhost:" + PORT + "/dashboard               ║");
+  console.log("║  Features:  tools, streaming, mcp, retry, fallback         ║");
+  console.log("╠════════════════════════════════════════════════════════════╣");
+  console.log("║  Retry Config:                                             ║");
+  console.log(`║    Fallback Model: ${FALLBACK_MODEL.padEnd(39)}║`);
+  console.log(`║    Max Retries:    ${String(MAX_RETRIES).padEnd(39)}║`);
+  console.log(`║    Retry Delay:    ${(RETRY_DELAY_MS + 'ms').padEnd(39)}║`);
+  console.log(`║    Fallback on 429: ${String(FALLBACK_ON_RATE_LIMIT).padEnd(38)}║`);
   console.log("╚════════════════════════════════════════════════════════════╝");
   console.log("");
 });

@@ -137,6 +137,132 @@ The proxy fully supports Claude Code's agent capabilities and MCP (Model Context
 | `id` | `id` | Preserved |
 | `model` | `model` | Preserved |
 
+## Retry and Fallback
+
+The proxy includes automatic retry logic with exponential backoff and model fallback support.
+
+### Retry Flow
+
+```
+Request with Primary Model
+         ↓
+      Success? ──────────────────→ Return response
+         ↓ No
+      Rate Limit (429)?
+         ↓ Yes                         ↓ No
+   Fallback on 429 enabled?      Retry with backoff
+         ↓ Yes        ↓ No              ↓
+   Switch to       Retry with      Max retries?
+   Fallback        backoff              ↓ Yes
+         ↓              ↓          Switch to Fallback
+         └──────────────┴──────────────┘
+                        ↓
+              Retry Fallback Model
+                        ↓
+                   Success? → Return response
+                        ↓ No
+                   Max retries? → Return error
+```
+
+### Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PROXY_MODEL_FALLBACK` | `z-ai/glm-4.5-air` | Fallback model |
+| `PROXY_MAX_RETRIES` | `3` | Retries per model |
+| `PROXY_RETRY_DELAY_MS` | `1000` | Initial delay (doubles each retry) |
+| `PROXY_FALLBACK_ON_RATE_LIMIT` | `true` | Skip retries on 429 |
+
+### Response Headers
+
+The proxy adds an `X-Model-Used` header to indicate which model served the request. This is useful for debugging when fallback occurs.
+
+### Logging
+
+When retry/fallback occurs, the proxy logs:
+- Each retry attempt with model name
+- Rate limit detection
+- Model switches
+- Final success or failure
+
+Example log output:
+```
+Trying model: qwen/qwen-2.5-coder-32b-instruct (attempt 1/3)
+Attempt 1/3 failed: rate_limit
+Rate limited (429), switching to fallback model: z-ai/glm-4.5-air
+Trying model: z-ai/glm-4.5-air (attempt 1/3)
+Success with model: z-ai/glm-4.5-air
+```
+
+## Usage Dashboard
+
+The proxy includes a real-time usage dashboard at `/dashboard`.
+
+### Accessing the Dashboard
+
+**JSON format (default):**
+```bash
+curl http://localhost:8787/dashboard
+```
+
+**HTML format (visual dashboard):**
+```bash
+# Open in browser
+http://localhost:8787/dashboard?format=html
+```
+
+### Dashboard Metrics
+
+| Category | Metrics |
+|----------|---------|
+| Requests | Total, streaming, non-streaming, with tools |
+| Tokens | Total, input, output |
+| Models | Per-model request and token counts |
+| Errors | Total, rate limits (429), API errors, network errors, error rate |
+| Session | Uptime, last request timestamp, fallback count |
+
+### Example Response
+
+```json
+{
+  "status": "ok",
+  "uptime": "2h 15m 30s",
+  "lastRequest": "2026-01-30T10:30:00.000Z",
+  "requests": {
+    "total": 150,
+    "streaming": 120,
+    "nonStreaming": 30,
+    "withTools": 85
+  },
+  "tokens": {
+    "total": 125000,
+    "input": 75000,
+    "output": 50000
+  },
+  "models": {
+    "qwen/qwen-2.5-coder-32b-instruct": {
+      "requests": 140,
+      "inputTokens": 70000,
+      "outputTokens": 47000
+    }
+  },
+  "errors": {
+    "total": 5,
+    "rateLimits": 3,
+    "apiErrors": 2,
+    "networkErrors": 0,
+    "rate": "3.33%"
+  },
+  "fallbacks": 8
+}
+```
+
+### Notes
+
+- Statistics are stored in-memory and reset when the proxy restarts
+- The HTML dashboard auto-refreshes every 10 seconds
+- Token counts are only available for non-streaming responses
+
 ## Docker Container
 
 The proxy runs in a Docker container:
@@ -160,7 +286,8 @@ The proxy runs in a Docker container:
 │  │              → convert →    │   │
 │  │              → respond      │   │
 │  │                             │   │
-│  │  /health → OK               │   │
+│  │  /health    → OK            │   │
+│  │  /dashboard → stats         │   │
 │  └─────────────────────────────┘   │
 │                                     │
 └─────────────────────────────────────┘
