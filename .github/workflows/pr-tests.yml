@@ -3,8 +3,18 @@ name: PR Tests
 on:
   pull_request:
     branches: [main]
+    paths:
+      - 'Dockerfile.y-router'
+      - 'docker-compose.yml'
+      - 'test-*.js'
+      - '.github/workflows/pr-tests.yml'
   push:
     branches: [main]
+    paths:
+      - 'Dockerfile.y-router'
+      - 'docker-compose.yml'
+      - 'test-*.js'
+      - '.github/workflows/pr-tests.yml'
 
 jobs:
   test:
