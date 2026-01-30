@@ -230,6 +230,12 @@ if ([string]::IsNullOrWhiteSpace($workingDir)) {
 
 # Launch Claude Code
 Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  Usage Dashboard Available:" -ForegroundColor Yellow
+Write-Host "  http://localhost:8787/dashboard" -ForegroundColor White
+Write-Host "  (or http://localhost:8787/dashboard?format=html for visual view)" -ForegroundColor Gray
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
 Write-Host "Launching Claude Code..." -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Tip: To stop proxy later, run: docker compose -f $scriptDir\docker-compose.yml down" -ForegroundColor Gray

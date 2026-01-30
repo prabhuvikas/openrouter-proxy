@@ -6,18 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Changed
-- Restructured documentation into `docs/` folder
-- Moved test files to `tests/` folder
-- Streamlined README.md with links to detailed docs
-
 ### Added
+- **Usage Dashboard** (v2.2.0)
+  - Real-time statistics at `/dashboard` endpoint
+  - Request counts (total, streaming, non-streaming, with tools)
+  - Token usage tracking (input, output, per-model breakdown)
+  - Error tracking (rate limits, API errors, network errors, error rate)
+  - Session info (uptime, last request timestamp, fallback count)
+  - HTML view with auto-refresh at `/dashboard?format=html`
+- **Model fallback and retry logic** (v2.1.0)
+  - Automatic retry with exponential backoff on failures
+  - Fallback to secondary model when primary exhausts retries
+  - Configurable via `PROXY_MODEL_FALLBACK`, `PROXY_MAX_RETRIES`, `PROXY_RETRY_DELAY_MS`
+  - Option to immediately fallback on rate limit (429) via `PROXY_FALLBACK_ON_RATE_LIMIT`
+  - `X-Model-Used` response header shows which model served the request
 - `docs/setup.md` - Detailed installation guide
 - `docs/configuration.md` - Environment variable reference
 - `docs/architecture.md` - Proxy internals and agent/MCP support
 - `docs/troubleshooting.md` - Common issues and solutions
 - `docs/models.md` - OpenRouter model recommendations
 - `tests/fixtures/` folder for test data
+
+### Changed
+- Restructured documentation into `docs/` folder
+- Moved test files to `tests/` folder
+- Streamlined README.md with links to detailed docs
+- Proxy version bumped to 2.2.0
 
 ### Removed
 - `LATEST_UPDATES.md` (replaced by CHANGELOG.md)

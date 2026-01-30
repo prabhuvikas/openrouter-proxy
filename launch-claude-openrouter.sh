@@ -184,6 +184,12 @@ fi
 
 # Launch Claude Code
 echo ""
+echo "========================================"
+echo "  Usage Dashboard Available:"
+echo "  http://localhost:8787/dashboard"
+echo "  (or http://localhost:8787/dashboard?format=html for visual view)"
+echo "========================================"
+echo ""
 echo "Launching Claude Code..."
 echo ""
 echo "Tip: To stop proxy later, run: docker compose -f $SCRIPT_DIR/docker-compose.yml down"
