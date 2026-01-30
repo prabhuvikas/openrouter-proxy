@@ -1,3 +1,8 @@
+---
+layout: default
+title: Setup Guide
+---
+
 # Setup Guide
 
 This guide covers installing and configuring the OpenRouter proxy for Claude Code.

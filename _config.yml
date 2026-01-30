@@ -1,0 +1,36 @@
+# GitHub Pages Configuration
+title: OpenRouter Proxy
+description: Use any OpenRouter model with Claude Code CLI
+remote_theme: pages-themes/cayman@v0.2.0
+plugins:
+  - jekyll-remote-theme
+
+# Site settings
+baseurl: "/openrouter-proxy"
+url: "https://prabhuvikas.github.io"
+
+# Navigation
+nav:
+  - title: Home
+    url: /
+  - title: Setup
+    url: /docs/setup
+  - title: Configuration
+    url: /docs/configuration
+  - title: Architecture
+    url: /docs/architecture
+  - title: Troubleshooting
+    url: /docs/troubleshooting
+  - title: Models
+    url: /docs/models
+
+# Default front matter
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+  - scope:
+      path: "docs"
+    values:
+      layout: default
