@@ -6,7 +6,7 @@
  * - OPENROUTER_API_KEY environment variable
  * - Proxy running on localhost:8787
  *
- * Run: node test-integration.js
+ * Run: node tests/test-integration.js
  */
 
 const http = require('http');

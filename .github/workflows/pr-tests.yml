@@ -6,14 +6,14 @@ on:
     paths:
       - 'Dockerfile.y-router'
       - 'docker-compose.yml'
-      - 'test-*.js'
+      - 'tests/**'
       - '.github/workflows/pr-tests.yml'
   push:
     branches: [main]
     paths:
       - 'Dockerfile.y-router'
       - 'docker-compose.yml'
-      - 'test-*.js'
+      - 'tests/**'
       - '.github/workflows/pr-tests.yml'
 
 jobs:
@@ -67,7 +67,7 @@ jobs:
       - name: Run unit tests (format conversion)
         run: |
           echo "Running conversion tests..."
-          node test-conversion.js
+          node tests/test-conversion.js
 
       - name: Run integration tests (API calls)
         env:
@@ -75,7 +75,7 @@ jobs:
           TEST_MODEL: z-ai/glm-4.5-air
         run: |
           echo "Running integration tests with model: $TEST_MODEL"
-          node test-integration.js
+          node tests/test-integration.js
 
       - name: Show proxy logs on failure
         if: failure()
