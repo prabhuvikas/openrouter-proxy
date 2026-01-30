@@ -228,19 +228,6 @@ if ([string]::IsNullOrWhiteSpace($workingDir)) {
     Write-Host "Using directory: $workingDir" -ForegroundColor Gray
 }
 
-# Prompt for additional CLI arguments
-Write-Host ""
-Write-Host "Additional CLI options (or press Enter to skip):" -ForegroundColor Cyan
-Write-Host "  Examples:" -ForegroundColor Gray
-Write-Host "    --mcp-config path/to/mcp.json    (MCP plugins)" -ForegroundColor Gray
-Write-Host "    --allowedTools 'Bash,Read,Write' (restrict tools)" -ForegroundColor Gray
-Write-Host "    --verbose                        (verbose output)" -ForegroundColor Gray
-$additionalArgs = Read-Host
-
-if (-Not [string]::IsNullOrWhiteSpace($additionalArgs)) {
-    Write-Host "Additional arguments: $additionalArgs" -ForegroundColor Gray
-}
-
 # Launch Claude Code
 Write-Host ""
 Write-Host "Launching Claude Code..." -ForegroundColor Cyan
@@ -249,13 +236,8 @@ Write-Host "Tip: To stop proxy later, run: docker compose -f $scriptDir\docker-c
 Write-Host ""
 
 try {
-    if ([string]::IsNullOrWhiteSpace($additionalArgs)) {
-        & claude $workingDir
-    } else {
-        # Parse additional arguments and invoke claude with all args
-        $argArray = @($workingDir) + ($additionalArgs -split ' (?=-)' | Where-Object { $_ })
-        & claude @argArray
-    }
+    Push-Location $workingDir
+    & claude
 }
 catch {
     Write-Host ""
@@ -271,4 +253,7 @@ catch {
     docker compose down 2>$null | Out-Null
     Pop-Location
     exit 1
+}
+finally {
+    Pop-Location
 }

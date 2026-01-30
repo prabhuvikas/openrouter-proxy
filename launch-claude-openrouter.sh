@@ -167,6 +167,21 @@ echo "  - ANTHROPIC_MODEL: $MAIN_MODEL"
 echo "  - ANTHROPIC_SMALL_FAST_MODEL: $SMALL_MODEL"
 echo "  - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: 1"
 
+# Prompt for working directory
+echo ""
+read -p "Enter working directory for Claude Code (or press Enter for current directory): " WORKING_DIR
+
+if [ -z "$WORKING_DIR" ]; then
+    WORKING_DIR="$(pwd)"
+    echo "Using current directory: $WORKING_DIR"
+elif [ ! -d "$WORKING_DIR" ]; then
+    echo "Directory does not exist: $WORKING_DIR"
+    echo "Using current directory instead."
+    WORKING_DIR="$(pwd)"
+else
+    echo "Using directory: $WORKING_DIR"
+fi
+
 # Launch Claude Code
 echo ""
 echo "Launching Claude Code..."
@@ -188,5 +203,6 @@ if ! command -v claude &> /dev/null; then
     exit 1
 fi
 
-# Launch Claude Code
+# Launch Claude Code from working directory
+cd "$WORKING_DIR"
 claude

@@ -28,6 +28,35 @@ docker compose up -d
 ./launch-claude-openrouter.sh
 ```
 
+## Project Structure
+
+```
+openrouter-proxy/
+├── README.md                    # Quick start and overview
+├── CLAUDE.md                    # This file - Claude Code guidelines
+├── CHANGELOG.md                 # Version history
+├── .env.example                 # Configuration template
+│
+├── docs/                        # Documentation
+│   ├── setup.md                 # Detailed installation guide
+│   ├── configuration.md         # Environment variables reference
+│   ├── architecture.md          # How the proxy works
+│   ├── troubleshooting.md       # Common issues and solutions
+│   └── models.md                # OpenRouter model recommendations
+│
+├── tests/                       # Test files
+│   ├── test-conversion.js       # Format conversion tests
+│   ├── test-integration.js      # API integration tests
+│   ├── test-mcp-tools.js        # MCP/tools support tests
+│   └── fixtures/
+│       └── agent-request.json   # Sample agent request
+│
+├── Dockerfile.y-router          # Proxy server (Express.js)
+├── docker-compose.yml           # Docker service definition
+├── launch-claude-openrouter.ps1 # Windows launcher
+└── launch-claude-openrouter.sh  # Mac/Linux launcher
+```
+
 ## Key Files
 
 | File | Purpose |
@@ -46,7 +75,7 @@ docker compose up -d
 | `ANTHROPIC_MODEL` | Main model (default: `qwen/qwen-2.5-coder-32b-instruct`) |
 | `ANTHROPIC_SMALL_FAST_MODEL` | Fast model (default: `z-ai/glm-4.5-air`) |
 
-Configure via `.env` file or environment variables. See `ENV_CONFIGURATION_GUIDE.md`.
+Configure via `.env` file or environment variables. See `docs/configuration.md`.
 
 ## Format Conversion (in Dockerfile.y-router)
 
@@ -62,11 +91,15 @@ The proxy handles:
 # Test proxy health
 curl http://localhost:8787/health
 
+# Run unit tests
+node tests/test-conversion.js
+
+# Run integration tests (requires OPENROUTER_API_KEY)
+OPENROUTER_API_KEY=sk-or-v1-... node tests/test-integration.js
+
 # View proxy logs
 docker logs y-router
 ```
-
-Test files: `test-agent-request.json`, `test-conversion.js`
 
 ## Debugging
 
@@ -74,3 +107,5 @@ Test files: `test-agent-request.json`, `test-conversion.js`
 2. **API key issues:** Must start with `sk-or-v1-`
 3. **Model errors:** Verify model name matches OpenRouter's model IDs
 4. **Agent/tool issues:** Check proxy logs for conversion errors
+
+See `docs/troubleshooting.md` for more details.
