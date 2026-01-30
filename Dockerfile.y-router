@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Standalone Node.js proxy for Anthropic to OpenAI format conversion
 # Properly handles Claude Code requests and forwards to OpenRouter
 
@@ -39,53 +40,24 @@ app.use(express.json({ limit: "50mb" }));
 const PORT = 8787;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
-// Format conversion functions
+// ============================================================================
+// FORMAT CONVERSION FUNCTIONS
+// ============================================================================
 
-// Convert Anthropic messages to OpenAI format (with agent/MCP support)
-function convertMessages(anthropicMessages) {
-  return anthropicMessages.map(msg => {
-    const openaiMsg = {
-      role: msg.role,
-      content: msg.content
-    };
+// Convert Anthropic tool_choice to OpenAI format
+// Anthropic: { type: "auto" | "any" | "tool", name?: string }
+// OpenAI: "auto" | "required" | { type: "function", function: { name: string } }
+function convertToolChoice(anthropicChoice) {
+  if (!anthropicChoice) return undefined;
 
-    // Handle complex content (text, tool_use, tool_result) - common in agents
-    if (msg.content && Array.isArray(msg.content)) {
-      const content = [];
+  if (anthropicChoice.type === 'auto') return 'auto';
+  if (anthropicChoice.type === 'any') return 'required';
+  if (anthropicChoice.type === 'tool' && anthropicChoice.name) {
+    return { type: 'function', function: { name: anthropicChoice.name } };
+  }
 
-      for (const block of msg.content) {
-        if (block.type === 'tool_result') {
-          // Preserve tool result metadata for agent loops
-          const toolResult = {
-            type: 'tool_result',
-            tool_use_id: block.tool_use_id,
-            content: block.content
-          };
-
-          // Preserve error flag if present (important for agent error handling)
-          if (block.is_error) {
-            toolResult.is_error = block.is_error;
-          }
-
-          content.push(toolResult);
-        } else if (block.type === 'text') {
-          // Add text directly to content array
-          content.push(block.text);
-        } else if (block.type === 'tool_use') {
-          // If somehow we get a tool_use in the message (shouldn't happen), skip it
-          // OpenAI format doesn't expect tool_use in messages
-          console.log("Warning: Found tool_use block in message content (should not happen)");
-        } else {
-          // Pass through any other block types
-          content.push(block);
-        }
-      }
-
-      openaiMsg.content = content;
-    }
-
-    return openaiMsg;
-  });
+  // Pass through if already in OpenAI format or unknown
+  return anthropicChoice;
 }
 
 // Convert Anthropic tools to OpenAI functions
@@ -96,21 +68,153 @@ function convertTools(anthropicTools) {
     type: 'function',
     function: {
       name: tool.name,
-      description: tool.description,
-      parameters: tool.input_schema
+      description: tool.description || '',
+      parameters: tool.input_schema || { type: 'object', properties: {} }
     }
   }));
 }
 
+// Convert Anthropic messages to OpenAI format (with agent/MCP support)
+// Handles: text, tool_use (in assistant messages), tool_result (in user messages)
+function convertMessages(anthropicMessages) {
+  const openaiMessages = [];
+
+  for (const msg of anthropicMessages) {
+    // Simple string content
+    if (typeof msg.content === 'string') {
+      openaiMessages.push({
+        role: msg.role,
+        content: msg.content
+      });
+      continue;
+    }
+
+    // Array content - needs special handling
+    if (Array.isArray(msg.content)) {
+      if (msg.role === 'assistant') {
+        // Assistant messages may contain tool_use blocks
+        const textParts = [];
+        const toolCalls = [];
+
+        for (const block of msg.content) {
+          if (block.type === 'text') {
+            textParts.push(block.text);
+          } else if (block.type === 'tool_use') {
+            // Convert Anthropic tool_use to OpenAI tool_calls format
+            toolCalls.push({
+              id: block.id,
+              type: 'function',
+              function: {
+                name: block.name,
+                arguments: typeof block.input === 'string'
+                  ? block.input
+                  : JSON.stringify(block.input || {})
+              }
+            });
+          }
+        }
+
+        const assistantMsg = {
+          role: 'assistant',
+          content: textParts.join('\n') || null
+        };
+
+        if (toolCalls.length > 0) {
+          assistantMsg.tool_calls = toolCalls;
+        }
+
+        openaiMessages.push(assistantMsg);
+      } else if (msg.role === 'user') {
+        // User messages may contain tool_result blocks
+        // These need to be split into separate "tool" role messages
+        const textParts = [];
+        const toolResults = [];
+
+        for (const block of msg.content) {
+          if (block.type === 'text') {
+            textParts.push(block.text);
+          } else if (block.type === 'tool_result') {
+            toolResults.push(block);
+          } else if (block.type === 'image') {
+            // Handle image blocks (vision)
+            textParts.push({
+              type: 'image_url',
+              image_url: {
+                url: block.source?.data
+                  ? `data:${block.source.media_type};base64,${block.source.data}`
+                  : block.source?.url || ''
+              }
+            });
+          } else {
+            // Pass through other content types
+            textParts.push(block);
+          }
+        }
+
+        // Add tool results as separate "tool" role messages (OpenAI format)
+        for (const tr of toolResults) {
+          let content = tr.content;
+
+          // Handle array content in tool results
+          if (Array.isArray(content)) {
+            content = content.map(c => {
+              if (typeof c === 'string') return c;
+              if (c.type === 'text') return c.text;
+              return JSON.stringify(c);
+            }).join('\n');
+          } else if (typeof content !== 'string') {
+            content = JSON.stringify(content);
+          }
+
+          openaiMessages.push({
+            role: 'tool',
+            tool_call_id: tr.tool_use_id,
+            content: content || ''
+          });
+        }
+
+        // Add text content as user message if present
+        if (textParts.length > 0) {
+          const hasComplexContent = textParts.some(p => typeof p !== 'string');
+          openaiMessages.push({
+            role: 'user',
+            content: hasComplexContent ? textParts : textParts.join('\n')
+          });
+        }
+      } else {
+        // Other roles - pass through
+        openaiMessages.push({
+          role: msg.role,
+          content: msg.content
+        });
+      }
+    } else {
+      // Fallback - pass through as-is
+      openaiMessages.push({
+        role: msg.role,
+        content: msg.content
+      });
+    }
+  }
+
+  return openaiMessages;
+}
+
+// Main request converter: Anthropic -> OpenAI
 function anthropicToOpenAI(anthropicMsg) {
-  // Handle system prompt - convert to OpenAI format
   let messages = convertMessages(anthropicMsg.messages || []);
 
-  // If system prompt is provided as a separate field, insert it as the first message
+  // Handle system prompt - insert as first message
   if (anthropicMsg.system) {
+    const systemContent = typeof anthropicMsg.system === 'string'
+      ? anthropicMsg.system
+      : Array.isArray(anthropicMsg.system)
+        ? anthropicMsg.system.map(s => s.text || s).join('\n')
+        : anthropicMsg.system;
+
     messages.unshift({
       role: 'system',
-      content: typeof anthropicMsg.system === 'string' ? anthropicMsg.system : anthropicMsg.system
+      content: systemContent
     });
   }
 
@@ -123,32 +227,50 @@ function anthropicToOpenAI(anthropicMsg) {
     stream: anthropicMsg.stream === true
   };
 
-  // Add tools if present (converted to OpenAI format)
+  // Add tools if present
   if (anthropicMsg.tools && anthropicMsg.tools.length > 0) {
     openaiMsg.tools = convertTools(anthropicMsg.tools);
   }
 
-  // Preserve other Anthropic parameters that OpenRouter/OpenAI might support
-  if (anthropicMsg.stop_sequences) {
-    openaiMsg.stop = anthropicMsg.stop_sequences;
+  // Convert tool_choice
+  if (anthropicMsg.tool_choice) {
+    openaiMsg.tool_choice = convertToolChoice(anthropicMsg.tool_choice);
   }
 
-  // Add tool_choice if specified (for agent behavior)
-  if (anthropicMsg.tool_choice) {
-    openaiMsg.tool_choice = anthropicMsg.tool_choice;
+  // Convert stop_sequences to stop
+  if (anthropicMsg.stop_sequences) {
+    openaiMsg.stop = anthropicMsg.stop_sequences;
   }
 
   // Remove undefined values
   Object.keys(openaiMsg).forEach(key => openaiMsg[key] === undefined && delete openaiMsg[key]);
 
-  console.log("Converted request - tools:", openaiMsg.tools ? openaiMsg.tools.length : 0, "with system prompt:", !!anthropicMsg.system);
+  console.log("Converted request - tools:", openaiMsg.tools ? openaiMsg.tools.length : 0,
+              "tool_choice:", openaiMsg.tool_choice,
+              "messages:", openaiMsg.messages.length,
+              "stream:", openaiMsg.stream);
   return openaiMsg;
 }
+
+// ============================================================================
+// NON-STREAMING RESPONSE CONVERSION
+// ============================================================================
 
 // Convert OpenAI complete response to Anthropic format
 function openAIResponseToAnthropic(openaiResponse, model) {
   if (!openaiResponse.choices || openaiResponse.choices.length === 0) {
-    return null;
+    return {
+      id: openaiResponse.id || 'msg_' + Date.now(),
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: '' }],
+      model: model,
+      stop_reason: 'end_turn',
+      usage: {
+        input_tokens: openaiResponse.usage?.prompt_tokens || 0,
+        output_tokens: openaiResponse.usage?.completion_tokens || 0
+      }
+    };
   }
 
   const choice = openaiResponse.choices[0];
@@ -158,28 +280,28 @@ function openAIResponseToAnthropic(openaiResponse, model) {
   const content = [];
 
   // Add text content if present
-  if (message.content && typeof message.content === 'string') {
+  if (message.content && typeof message.content === 'string' && message.content.trim()) {
     content.push({
       type: 'text',
       text: message.content
     });
   }
 
-  // Convert tool calls to Anthropic format (important for agents/MCP)
+  // Convert tool calls to Anthropic tool_use format
   if (message.tool_calls && Array.isArray(message.tool_calls)) {
     console.log("Converting", message.tool_calls.length, "tool calls to Anthropic format");
 
-    message.tool_calls.forEach(toolCall => {
+    for (const toolCall of message.tool_calls) {
       if (toolCall.type === 'function') {
         let parsedInput = {};
 
-        // Parse tool arguments if they're a string
         if (typeof toolCall.function.arguments === 'string') {
           try {
             parsedInput = JSON.parse(toolCall.function.arguments);
           } catch (e) {
             console.error("Failed to parse tool arguments:", e.message);
-            parsedInput = { raw: toolCall.function.arguments };
+            // Try to salvage what we can
+            parsedInput = { _raw: toolCall.function.arguments };
           }
         } else {
           parsedInput = toolCall.function.arguments || {};
@@ -192,15 +314,27 @@ function openAIResponseToAnthropic(openaiResponse, model) {
           input: parsedInput
         });
       }
-    });
+    }
   }
 
-  // If no content, add empty text
+  // Ensure at least empty text if no content
   if (content.length === 0) {
     content.push({
       type: 'text',
       text: ''
     });
+  }
+
+  // Determine stop_reason
+  let stopReason = 'end_turn';
+  if (message.tool_calls && message.tool_calls.length > 0) {
+    stopReason = 'tool_use';
+  } else if (choice.finish_reason === 'length') {
+    stopReason = 'max_tokens';
+  } else if (choice.finish_reason === 'stop') {
+    stopReason = 'end_turn';
+  } else if (choice.finish_reason === 'tool_calls') {
+    stopReason = 'tool_use';
   }
 
   return {
@@ -209,7 +343,7 @@ function openAIResponseToAnthropic(openaiResponse, model) {
     role: 'assistant',
     content: content,
     model: model,
-    stop_reason: message.tool_calls ? 'tool_use' : (choice.finish_reason === 'length' ? 'max_tokens' : 'end_turn'),
+    stop_reason: stopReason,
     usage: {
       input_tokens: openaiResponse.usage?.prompt_tokens || 0,
       output_tokens: openaiResponse.usage?.completion_tokens || 0
@@ -217,72 +351,230 @@ function openAIResponseToAnthropic(openaiResponse, model) {
   };
 }
 
-function openAIToAnthropic(openaiChunk) {
-  try {
-    // Parse SSE format if streaming
-    if (typeof openaiChunk === 'string' && openaiChunk.startsWith('data: ')) {
-      const jsonStr = openaiChunk.replace('data: ', '').trim();
-      if (jsonStr === '[DONE]') {
-        return { type: 'message_stop' };
-      }
-      const data = JSON.parse(jsonStr);
-      return convertDelta(data);
-    }
-    return convertDelta(openaiChunk);
-  } catch (e) {
-    console.error('Error converting response:', e.message);
-    return null;
-  }
+// ============================================================================
+// STREAMING RESPONSE CONVERSION
+// ============================================================================
+
+// Create a new stream state for tracking streaming responses
+function createStreamState(model) {
+  return {
+    model: model,
+    messageId: 'msg_' + Date.now(),
+    started: false,           // Has message_start been sent?
+    textBlockStarted: false,  // Has text content_block_start been sent?
+    textContent: '',          // Accumulated text content
+    toolCalls: {},            // Track tool calls by index: { id, name, args }
+    toolBlocksStarted: {},    // Track which tool blocks have been started
+    contentIndex: 0,          // Current content block index
+    finishReason: null        // Final finish reason
+  };
 }
 
-function convertDelta(data) {
-  if (!data.choices || !data.choices[0]) return null;
+// Process a streaming chunk and return Anthropic SSE events
+function processStreamingChunk(line, streamState) {
+  const events = [];
+
+  // Parse SSE data line
+  if (!line.startsWith('data: ')) {
+    return events;
+  }
+
+  const jsonStr = line.slice(6).trim();
+  if (jsonStr === '[DONE]') {
+    return events; // Will be handled in stream end
+  }
+
+  let data;
+  try {
+    data = JSON.parse(jsonStr);
+  } catch (e) {
+    console.error('Failed to parse streaming chunk:', e.message);
+    return events;
+  }
+
+  if (!data.choices || !data.choices[0]) {
+    return events;
+  }
 
   const choice = data.choices[0];
   const delta = choice.delta || {};
 
-  // Handle content_filter events
-  if (choice.content_filter_results) {
-    return null;
+  // Emit message_start on first chunk
+  if (!streamState.started) {
+    streamState.started = true;
+    events.push({
+      type: 'message_start',
+      message: {
+        id: streamState.messageId,
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: streamState.model,
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 }
+      }
+    });
   }
 
-  // Text content streaming
+  // Handle text content delta
   if (delta.content) {
-    return {
+    // Start text block if not started
+    if (!streamState.textBlockStarted) {
+      streamState.textBlockStarted = true;
+      streamState.contentIndex = 0;
+      events.push({
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' }
+      });
+    }
+
+    // Send text delta
+    streamState.textContent += delta.content;
+    events.push({
       type: 'content_block_delta',
       index: 0,
-      content_block: { type: 'text' },
       delta: { type: 'text_delta', text: delta.content }
-    };
+    });
   }
 
-  // Tool call start
+  // Handle tool calls delta
   if (delta.tool_calls && delta.tool_calls.length > 0) {
-    const toolCall = delta.tool_calls[0];
-    return {
-      type: 'content_block_start',
-      index: 0,
-      content_block: {
-        type: 'tool_use',
-        id: toolCall.id,
-        name: toolCall.function?.name || '',
-        input: {}
+    for (const tc of delta.tool_calls) {
+      const idx = tc.index;
+
+      // Initialize tool call tracking if new
+      if (!streamState.toolCalls[idx]) {
+        streamState.toolCalls[idx] = { id: '', name: '', args: '' };
       }
-    };
+
+      const toolState = streamState.toolCalls[idx];
+
+      // Capture tool call id
+      if (tc.id) {
+        toolState.id = tc.id;
+      }
+
+      // Capture/accumulate function name
+      if (tc.function?.name) {
+        toolState.name += tc.function.name;
+      }
+
+      // Accumulate function arguments
+      if (tc.function?.arguments) {
+        toolState.args += tc.function.arguments;
+      }
+
+      // Start tool_use block when we have id and name
+      if (toolState.id && toolState.name && !streamState.toolBlocksStarted[idx]) {
+        // Close text block first if it was started
+        if (streamState.textBlockStarted && streamState.contentIndex === 0) {
+          events.push({
+            type: 'content_block_stop',
+            index: 0
+          });
+          streamState.contentIndex = 1;
+        } else if (!streamState.textBlockStarted) {
+          // No text block was started, tool starts at index 0
+          streamState.contentIndex = 0;
+        }
+
+        streamState.toolBlocksStarted[idx] = true;
+        const toolIndex = streamState.textBlockStarted ? idx + 1 : idx;
+
+        events.push({
+          type: 'content_block_start',
+          index: toolIndex,
+          content_block: {
+            type: 'tool_use',
+            id: toolState.id,
+            name: toolState.name,
+            input: {}
+          }
+        });
+      }
+
+      // Send input_json_delta for arguments
+      if (tc.function?.arguments && streamState.toolBlocksStarted[idx]) {
+        const toolIndex = streamState.textBlockStarted ? idx + 1 : idx;
+        events.push({
+          type: 'content_block_delta',
+          index: toolIndex,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: tc.function.arguments
+          }
+        });
+      }
+    }
   }
 
-  // Finish reason (end of message)
+  // Handle finish reason
   if (choice.finish_reason) {
-    const stopReason = choice.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn';
-    return {
-      type: 'message_delta',
-      delta: { stop_reason: stopReason },
-      stop_reason: stopReason
-    };
+    streamState.finishReason = choice.finish_reason;
   }
 
-  return null;
+  return events;
 }
+
+// Generate final events when stream ends
+function generateStreamEndEvents(streamState) {
+  const events = [];
+
+  // Close any open text block
+  if (streamState.textBlockStarted) {
+    let needsClose = true;
+    // Check if already closed (tool blocks started would have closed it)
+    if (Object.keys(streamState.toolBlocksStarted).length > 0) {
+      needsClose = false; // Already closed when tool block started
+    }
+    if (needsClose) {
+      events.push({
+        type: 'content_block_stop',
+        index: 0
+      });
+    }
+  }
+
+  // Close any open tool blocks
+  const toolIndices = Object.keys(streamState.toolBlocksStarted).map(Number).sort((a, b) => a - b);
+  for (const idx of toolIndices) {
+    const toolIndex = streamState.textBlockStarted ? idx + 1 : idx;
+    events.push({
+      type: 'content_block_stop',
+      index: toolIndex
+    });
+  }
+
+  // Determine stop_reason
+  let stopReason = 'end_turn';
+  if (Object.keys(streamState.toolCalls).length > 0) {
+    stopReason = 'tool_use';
+  } else if (streamState.finishReason === 'length') {
+    stopReason = 'max_tokens';
+  } else if (streamState.finishReason === 'tool_calls') {
+    stopReason = 'tool_use';
+  }
+
+  // Send message_delta with stop_reason
+  events.push({
+    type: 'message_delta',
+    delta: { stop_reason: stopReason, stop_sequence: null },
+    usage: { output_tokens: 0 }
+  });
+
+  // Send message_stop
+  events.push({
+    type: 'message_stop'
+  });
+
+  return events;
+}
+
+// ============================================================================
+// HTTP SERVER AND REQUEST HANDLING
+// ============================================================================
 
 // Logging middleware
 app.use((req, res, next) => {
@@ -304,14 +596,20 @@ app.all("/v1/messages", (req, res) => {
   const hasSystem = !!req.body.system;
   const hasTools = req.body.tools && req.body.tools.length > 0;
   const messageCount = req.body.messages ? req.body.messages.length : 0;
+  const hasToolChoice = !!req.body.tool_choice;
 
-  if (hasSystem || hasTools) {
-    console.log(`Agent/MCP request: system=${hasSystem}, tools=${req.body.tools?.length || 0}, messages=${messageCount}`);
+  console.log(`Request details: system=${hasSystem}, tools=${req.body.tools?.length || 0}, ` +
+              `messages=${messageCount}, tool_choice=${hasToolChoice}, stream=${req.body.stream}`);
+
+  // Log tool names if present
+  if (hasTools) {
+    const toolNames = req.body.tools.map(t => t.name).join(', ');
+    console.log(`  Tools: ${toolNames}`);
   }
 
   // Convert Anthropic format to OpenAI format
   const openaiBody = anthropicToOpenAI(req.body);
-  console.log("Converted to OpenAI format, model:", openaiBody.model, "streaming:", openaiBody.stream);
+  console.log("Converted to OpenAI format, sending to OpenRouter");
 
   // Prepare OpenRouter request
   const options = {
@@ -322,7 +620,9 @@ app.all("/v1/messages", (req, res) => {
     headers: {
       "Content-Type": "application/json",
       "Authorization": authToken,
-      "User-Agent": "Claude-Proxy/1.0"
+      "User-Agent": "Claude-Proxy/1.0",
+      "HTTP-Referer": "https://github.com/anthropics/claude-code",
+      "X-Title": "Claude Code Proxy"
     }
   };
 
@@ -331,33 +631,83 @@ app.all("/v1/messages", (req, res) => {
   const proxyReq = https.request(options, (proxyRes) => {
     console.log("OpenRouter response status:", proxyRes.statusCode);
 
+    // Handle error status codes
+    if (proxyRes.statusCode >= 400) {
+      let errorData = '';
+      proxyRes.on('data', chunk => errorData += chunk);
+      proxyRes.on('end', () => {
+        console.error("OpenRouter error response:", errorData);
+        try {
+          const errorJson = JSON.parse(errorData);
+          // Convert to Anthropic error format
+          res.status(proxyRes.statusCode).json({
+            type: 'error',
+            error: {
+              type: errorJson.error?.type || 'api_error',
+              message: errorJson.error?.message || errorData
+            }
+          });
+        } catch (e) {
+          res.status(proxyRes.statusCode).json({
+            type: 'error',
+            error: { type: 'api_error', message: errorData }
+          });
+        }
+      });
+      return;
+    }
+
     // For streaming responses
     if (openaiBody.stream) {
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
       });
 
+      const streamState = createStreamState(openaiBody.model);
       let buffer = '';
+
       proxyRes.on('data', (chunk) => {
         buffer += chunk.toString();
         const lines = buffer.split('\n');
-        buffer = lines[lines.length - 1];
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
-        for (let i = 0; i < lines.length - 1; i++) {
-          const line = lines[i];
-          if (line.startsWith('data: ')) {
-            const converted = openAIToAnthropic(line);
-            if (converted) {
-              res.write(`data: ${JSON.stringify(converted)}\n\n`);
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine) continue;
+
+          if (trimmedLine.startsWith('data: ')) {
+            const events = processStreamingChunk(trimmedLine, streamState);
+            for (const event of events) {
+              res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
             }
           }
         }
       });
 
       proxyRes.on('end', () => {
-        res.write('data: {"type":"message_stop"}\n\n');
+        // Process any remaining buffer
+        if (buffer.trim()) {
+          const events = processStreamingChunk(buffer.trim(), streamState);
+          for (const event of events) {
+            res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+          }
+        }
+
+        // Generate end events
+        const endEvents = generateStreamEndEvents(streamState);
+        for (const event of endEvents) {
+          res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+        }
+
+        console.log("Streaming complete, tool_calls:", Object.keys(streamState.toolCalls).length);
+        res.end();
+      });
+
+      proxyRes.on('error', (err) => {
+        console.error("Streaming error:", err.message);
         res.end();
       });
     } else {
@@ -366,54 +716,106 @@ app.all("/v1/messages", (req, res) => {
       proxyRes.on('data', (chunk) => {
         data += chunk;
       });
+
       proxyRes.on('end', () => {
         try {
           const openaiResponse = JSON.parse(data);
-          console.log("OpenRouter response received, converting to Anthropic format");
+          console.log("OpenRouter response received");
 
-          // If it's an error response, pass it through
+          // If it's an error response, convert to Anthropic format
           if (openaiResponse.error) {
             console.log("Error response from OpenRouter:", openaiResponse.error);
-            res.status(proxyRes.statusCode).json(openaiResponse);
+            res.status(proxyRes.statusCode >= 400 ? proxyRes.statusCode : 400).json({
+              type: 'error',
+              error: {
+                type: openaiResponse.error.type || 'api_error',
+                message: openaiResponse.error.message || JSON.stringify(openaiResponse.error)
+              }
+            });
             return;
           }
 
           // Convert OpenAI format to Anthropic format
           const anthropicResponse = openAIResponseToAnthropic(openaiResponse, openaiBody.model);
-          console.log("Converted response, sending back to Claude Code");
-          res.status(proxyRes.statusCode).json(anthropicResponse);
+
+          // Log response details
+          const toolUseCount = anthropicResponse.content.filter(c => c.type === 'tool_use').length;
+          console.log(`Response: stop_reason=${anthropicResponse.stop_reason}, ` +
+                      `content_blocks=${anthropicResponse.content.length}, tool_use=${toolUseCount}`);
+
+          res.status(200).json(anthropicResponse);
         } catch (e) {
           console.error("Error parsing response:", e.message);
-          res.status(proxyRes.statusCode).send(data);
+          console.error("Raw response:", data.substring(0, 500));
+          res.status(500).json({
+            type: 'error',
+            error: { type: 'api_error', message: 'Failed to parse OpenRouter response' }
+          });
         }
       });
     }
   });
 
   proxyReq.on("error", (err) => {
-    console.error("OpenRouter error:", err.message);
-    res.status(502).json({ error: "Bad Gateway", message: err.message });
+    console.error("OpenRouter connection error:", err.message);
+    res.status(502).json({
+      type: 'error',
+      error: { type: 'api_error', message: 'Failed to connect to OpenRouter: ' + err.message }
+    });
   });
 
   proxyReq.write(bodyStr);
   proxyReq.end();
 });
 
-// Health check
+// Health check endpoint
 app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+  res.json({
+    status: "ok",
+    version: "2.0.0",
+    features: ["tools", "streaming", "tool_choice", "mcp"]
+  });
 });
 
+// Info endpoint
 app.get("/", (req, res) => {
-  res.json({ name: "OpenRouter Proxy", status: "running" });
+  res.json({
+    name: "OpenRouter Proxy",
+    version: "2.0.0",
+    status: "running",
+    target: OPENROUTER_BASE,
+    features: {
+      tools: true,
+      streaming: true,
+      tool_choice: true,
+      mcp_support: true
+    }
+  });
+});
+
+// Debug endpoint to test tool conversion (useful for troubleshooting)
+app.post("/debug/convert", (req, res) => {
+  try {
+    const converted = anthropicToOpenAI(req.body);
+    res.json({
+      original: req.body,
+      converted: converted
+    });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
 });
 
 // Start server
 app.listen(PORT, () => {
   console.log("");
-  console.log("✓ Anthropic to OpenRouter proxy listening on http://localhost:" + PORT);
-  console.log("  Converting Anthropic format → OpenAI format");
-  console.log("  Forwarding to: " + OPENROUTER_BASE);
+  console.log("╔════════════════════════════════════════════════════════════╗");
+  console.log("║  OpenRouter Proxy v2.0.0 - MCP/Tools Support               ║");
+  console.log("╠════════════════════════════════════════════════════════════╣");
+  console.log("║  Local:    http://localhost:" + PORT + "                          ║");
+  console.log("║  Target:   " + OPENROUTER_BASE + "               ║");
+  console.log("║  Features: tools, streaming, tool_choice, mcp              ║");
+  console.log("╚════════════════════════════════════════════════════════════╝");
   console.log("");
 });
 
